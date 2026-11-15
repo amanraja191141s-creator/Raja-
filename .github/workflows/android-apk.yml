@@ -1,0 +1,268 @@
+name: SA Calculator - Verified Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sa-calculator-android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android-build:
+    name: Verify Source, Test and Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate or extract latest SA Calculator source
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+
+          # First accept a complete project already extracted at repository root.
+          mapfile -t root_manifests < <(
+            find . -maxdepth 5 -type f -name package.json \
+              -not -path '*/node_modules/*' \
+              -not -path '*/www/*' \
+              -not -path '*/android/*' \
+              -not -path '*/.git/*' \
+              -not -path './.github/*' | sort
+          )
+
+          if [ -s "$GITHUB_WORKSPACE/package.json" ]; then
+            APP_DIR="$GITHUB_WORKSPACE"
+            echo "Using extracted source from repository root."
+          else
+            mapfile -t archives < <(
+              find . -maxdepth 5 -type f -iname 'SA-Calculator-v*.zip' \
+                -not -path '*/.git/*' \
+                -not -path '*/node_modules/*' | sort -V
+            )
+
+            if [ "${#archives[@]}" -eq 0 ]; then
+              echo "::error::package.json was not found and no SA-Calculator-v*.zip archive was found."
+              exit 1
+            fi
+
+            SELECTED="${archives[${#archives[@]}-1]}"
+            echo "Selected source archive: $SELECTED"
+            unzip -tq "$SELECTED"
+
+            EXTRACT_DIR="$RUNNER_TEMP/sa-calculator-source"
+            rm -rf "$EXTRACT_DIR"
+            mkdir -p "$EXTRACT_DIR"
+            unzip -q "$SELECTED" -d "$EXTRACT_DIR"
+
+            mapfile -t manifests < <(
+              find "$EXTRACT_DIR" -maxdepth 9 -type f -name package.json \
+                -not -path '*/node_modules/*' \
+                -not -path '*/www/*' \
+                -not -path '*/android/*' | sort
+            )
+
+            if [ "${#manifests[@]}" -ne 1 ]; then
+              echo "::error::Multiple package.json files found; expected exactly one application manifest."
+              printf '%s\\n' "${manifests[@]}"
+              exit 1
+            fi
+
+            APP_DIR="$(dirname "${manifests[0]}")"
+          fi
+
+          APP_DIR="$(realpath "$APP_DIR")"
+          echo "app_dir=$APP_DIR" >> "$GITHUB_OUTPUT"
+          echo "Verified application root: $APP_DIR"
+
+      - name: Verify source files and project configuration
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in \
+            package.json \
+            capacitor.config.json \
+            index.html \
+            server.js \
+            service-worker.js \
+            manifest.webmanifest \
+            assets/js/app.js \
+            assets/js/localization.js \
+            assets/js/currency-localized-names.js \
+            assets/js/theme-bootstrap.js \
+            assets/css/app.css \
+            assets/brand/sa-calculator-icon.png \
+            scripts/prepare-android-web.mjs
+          do
+            test -s "$file" || {
+              echo "::error::Required source file missing: $file"
+              exit 1
+            }
+          done
+          test -d tests || {
+            echo "::error::Tests directory missing."
+            exit 1
+          }
+          node -e '
+            const p = require("./package.json");
+            if (p.name !== "sa-calculator") throw Error("Unexpected package name: " + p.name);
+            for (const s of ["test", "build:web"]) {
+              if (!p.scripts || !p.scripts[s]) throw Error("Missing npm script: " + s);
+            }
+            for (const d of ["@capacitor/core", "@capacitor/android"]) {
+              if (!p.dependencies || !p.dependencies[d]) throw Error("Missing dependency: " + d);
+            }
+            if (!p.devDependencies || !p.devDependencies["@capacitor/cli"]) throw Error("Missing Capacitor CLI");
+            const c = require("./capacitor.config.json");
+            if (c.webDir !== "www") throw Error("Capacitor webDir must be www");
+            console.log("Verified", p.name, p.version);
+          '
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Set up Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Verify Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${ANDROID_HOME:-}" ] && [ -z "${ANDROID_SDK_ROOT:-}" ]; then
+            echo "::error::Android SDK environment is missing."
+            exit 1
+          fi
+          echo "Android SDK environment detected."
+
+      - name: Install npm dependencies
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        run: npm install --no-audit --no-fund --fetch-retries=5
+
+      - name: Verify installed dependencies
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        run: npm ls --depth=0
+
+      - name: Validate JavaScript syntax
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check assets/js/app.js
+          node --check assets/js/localization.js
+          node --check assets/js/currency-localized-names.js
+          node --check assets/js/theme-bootstrap.js
+          node --check server.js
+          node --check service-worker.js
+          node --check scripts/prepare-android-web.mjs
+
+      - name: Make active workflow visible to regression tests
+        shell: bash
+        env:
+          APP_DIR: ${{ steps.locate.outputs.app_dir }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$APP_DIR/.github/workflows"
+          cp "$GITHUB_WORKSPACE/.github/workflows/main.yml" \
+             "$APP_DIR/.github/workflows/android-apk.yml"
+          echo "Regression tests will validate the active main.yml workflow."
+
+      - name: Run complete regression tests
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee "$RUNNER_TEMP/sa-calculator-test.log"
+
+      - name: Build Android web bundle
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        run: npm run build:web
+
+      - name: Verify generated web bundle
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in \
+            www/index.html \
+            www/service-worker.js \
+            www/manifest.webmanifest \
+            www/assets/js/app.js \
+            www/assets/js/localization.js \
+            www/assets/js/currency-localized-names.js \
+            www/assets/js/theme-bootstrap.js \
+            www/assets/css/app.css \
+            www/assets/brand/sa-calculator-icon.png
+          do
+            test -s "$file" || {
+              echo "::error::Generated asset missing: $file"
+              exit 1
+            }
+          done
+          echo "Generated Android web bundle verified."
+
+      - name: Create Android project if missing
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -s android/gradlew ]; then
+            echo "Existing Android project found."
+          elif [ ! -e android ]; then
+            npx cap add android
+          else
+            echo "::error::Android folder exists but Gradle wrapper is missing."
+            exit 1
+          fi
+
+      - name: Sync Capacitor Android
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        run: npx cap sync android
+
+      - name: Verify Gradle wrapper
+        working-directory: ${{ steps.locate.outputs.app_dir }}/android
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s gradlew
+          chmod +x gradlew
+          ./gradlew --version
+
+      - name: Build Android debug APK
+        working-directory: ${{ steps.locate.outputs.app_dir }}/android
+        run: ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Verify APK and checksum
+        working-directory: ${{ steps.locate.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="android/app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          ls -lh "$APK"
+          sha256sum "$APK"
+
+      - name: Upload Android debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SA-Calculator-Debug-APK
+          path: ${{ steps.locate.outputs.app_dir }}/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
